@@ -9,6 +9,8 @@ const path = require('path');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
+  pingInterval: 25000, // keep connection alive through Railway's proxy
+  pingTimeout: 10000,
   cors: {
     origin: process.env.NODE_ENV === 'production' ? undefined : /^http:\/\/localhost:/,
     methods: ['GET', 'POST'],
@@ -72,7 +74,27 @@ function advanceRound(room) {
     });
     room.state = 'finished';
   } else {
-    startRound(room);
+    const disconnectedPlayer = room.players.find(p => p.disconnected);
+    if (disconnectedPlayer) {
+      // Cancel their individual cleanup timer — the waiting timer is now the deadline.
+      clearTimeout(disconnectedPlayer.cleanupTimer);
+      room.waitingForPlayer = true;
+      io.to(room.code).emit('waiting_for_player', { playerName: disconnectedPlayer.name });
+      room.waitingTimer = setTimeout(() => {
+        room.waitingForPlayer = false;
+        removePlayer(room.code, disconnectedPlayer.id);
+        const scores = room.players.map(p => ({ id: p.id, name: p.name, score: p.score }));
+        scores.sort((a, b) => b.score - a.score);
+        io.to(room.code).emit('game_over', {
+          finalScores: scores,
+          winnerId: scores[0]?.id,
+          winnerName: scores[0]?.name,
+        });
+        room.state = 'finished';
+      }, 30000);
+    } else {
+      startRound(room);
+    }
   }
 }
 
@@ -110,6 +132,37 @@ io.on('connection', (socket) => {
         socket.emit('error', { message: 'Room not found' });
         return;
       }
+
+      // Rejoin path: mid-game reconnect where name matches a disconnected player.
+      const disconnectedPlayer = room.players.find(
+        p => p.disconnected && p.name.toLowerCase() === playerName.trim().toLowerCase()
+      );
+      if (disconnectedPlayer) {
+        clearTimeout(disconnectedPlayer.cleanupTimer);
+        if (room.waitingTimer) {
+          clearTimeout(room.waitingTimer);
+          room.waitingTimer = null;
+        }
+        disconnectedPlayer.id = socket.id;
+        disconnectedPlayer.disconnected = false;
+        socket.join(code);
+        const players = room.players.map(p => ({ id: p.id, name: p.name, score: p.score }));
+        socket.emit('rejoin_game', {
+          roomCode: code,
+          playerId: socket.id,
+          players,
+          totalRounds: room.totalRounds,
+          currentRound: room.currentRound + 1,
+        });
+        socket.to(code).emit('player_rejoined', { playerName: disconnectedPlayer.name, players });
+        console.log(`${playerName} rejoined room ${code}`);
+        if (room.waitingForPlayer) {
+          room.waitingForPlayer = false;
+          setTimeout(() => startRound(room), 1500);
+        }
+        return;
+      }
+
       if (room.state !== 'lobby') {
         socket.emit('error', { message: 'Game already in progress' });
         return;
@@ -161,7 +214,8 @@ io.on('connection', (socket) => {
     const room = getRoom(roomCode);
     if (!room || room.state !== 'playing' || !room.readyPlayers) return;
     room.readyPlayers.add(socket.id);
-    if (room.readyPlayers.size >= room.players.length) {
+    const activePlayers = room.players.filter(p => !p.disconnected);
+    if (room.readyPlayers.size >= activePlayers.length) {
       triggerPlay(room);
     }
   });
@@ -215,8 +269,18 @@ io.on('connection', (socket) => {
       if (room.hostId === socket.id) {
         clearTimeout(room.timer);
         clearTimeout(room.prepareTimer);
+        clearTimeout(room.waitingTimer);
         io.to(code).emit('error', { message: 'Host disconnected — game ended' });
         rooms.delete(code);
+      } else if (room.state === 'playing') {
+        // Mid-game: keep the player in the room for 30s so they can reconnect.
+        const player = room.players[playerIndex];
+        player.disconnected = true;
+        player.cleanupTimer = setTimeout(() => {
+          removePlayer(code, socket.id);
+          const players = room.players.map(p => ({ id: p.id, name: p.name, score: p.score }));
+          io.to(code).emit('player_joined', { players });
+        }, 30000);
       } else {
         removePlayer(code, socket.id);
         const players = room.players.map(p => ({ id: p.id, name: p.name, score: p.score }));

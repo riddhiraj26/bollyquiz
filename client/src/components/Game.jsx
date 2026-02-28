@@ -12,6 +12,7 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
   const [roundResult, setRoundResult] = useState(null);
   const [timeLeft, setTimeLeft] = useState(30);
   const [needsTap, setNeedsTap] = useState(false);
+  const [waitingForPlayer, setWaitingForPlayer] = useState(null);
 
   const audioBufferRef = useRef(null);  // decoded AudioBuffer ready to play
   const sourceNodeRef = useRef(null);   // currently playing AudioBufferSourceNode
@@ -71,6 +72,7 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
       setPhase('loading');
       setRoundResult(null);
       setNeedsTap(false);
+      setWaitingForPlayer(null);
 
       cleanupAudio();
       readySentRef.current = false;
@@ -177,16 +179,30 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
       setNeedsTap(false);
     };
 
+    const handleWaitingForPlayer = ({ playerName: name }) => {
+      dlog('recv', `waiting_for_player: ${name}`);
+      setWaitingForPlayer(name);
+    };
+
+    const handlePlayerRejoined = ({ playerName: name }) => {
+      dlog('recv', `player_rejoined: ${name}`);
+      setWaitingForPlayer(null);
+    };
+
     socket.on('prepare_round', handlePrepareRound);
     socket.on('play_now', handlePlayNow);
     socket.on('round_won', handleRoundWon);
     socket.on('round_timeout', handleRoundTimeout);
+    socket.on('waiting_for_player', handleWaitingForPlayer);
+    socket.on('player_rejoined', handlePlayerRejoined);
 
     return () => {
       socket.off('prepare_round', handlePrepareRound);
       socket.off('play_now', handlePlayNow);
       socket.off('round_won', handleRoundWon);
       socket.off('round_timeout', handleRoundTimeout);
+      socket.off('waiting_for_player', handleWaitingForPlayer);
+      socket.off('player_rejoined', handlePlayerRejoined);
       cleanupAudio();
       clearInterval(timerRef.current);
     };
@@ -337,6 +353,13 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
                   {roundResult.correctAnswer}
                 </p>
               </div>
+
+              {waitingForPlayer && (
+                <div className="flex items-center justify-center gap-2 text-white/40 text-sm mt-2">
+                  <div className="w-3 h-3 border border-white/30 border-t-white/60 rounded-full animate-spin" />
+                  <span>Waiting for {waitingForPlayer} to reconnect...</span>
+                </div>
+              )}
             </div>
           )}
         </div>

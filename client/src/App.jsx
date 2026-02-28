@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import socket from './socket';
 import { unlockAudio } from './audioUnlock';
 import { dlog } from './debugLog';
@@ -19,6 +19,17 @@ export default function App() {
   const [totalRounds, setTotalRounds] = useState(10);
   const [error, setError] = useState('');
   const [connecting, setConnecting] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+
+  // Refs so the once-mounted useEffect can always read fresh state values.
+  const screenRef = useRef('landing');
+  const roomCodeRef = useRef('');
+  const playerNameRef = useRef('');
+  const reconnectingRef = useRef(false);
+  useEffect(() => { screenRef.current = screen; }, [screen]);
+  useEffect(() => { roomCodeRef.current = roomCode; }, [roomCode]);
+  useEffect(() => { playerNameRef.current = playerName; }, [playerName]);
+  useEffect(() => { reconnectingRef.current = reconnecting; }, [reconnecting]);
 
   useEffect(() => {
     dlog('socket', `connected=${socket.connected}, id=${socket.id || 'none'}`);
@@ -30,10 +41,22 @@ export default function App() {
 
     const onConnect = () => {
       dlog('socket', `CONNECTED id=${socket.id}`);
+      if (reconnectingRef.current) {
+        dlog('socket', 'reconnected mid-game — attempting rejoin...');
+        socket.emit('join_room', {
+          roomCode: roomCodeRef.current,
+          playerName: playerNameRef.current,
+        });
+      }
     };
+
     const onDisconnect = (reason) => {
       dlog('socket', `DISCONNECTED reason=${reason}`);
+      if (screenRef.current !== 'landing') {
+        setReconnecting(true);
+      }
     };
+
     const onConnectError = (err) => {
       dlog('error', `connect_error: ${err.message}`);
     };
@@ -46,6 +69,15 @@ export default function App() {
       setPlayers(data.players);
       setError('');
       setScreen('lobby');
+    };
+
+    const onRejoinGame = (data) => {
+      dlog('recv', `rejoin_game room=${data.roomCode} round=${data.currentRound}`);
+      setPlayerId(data.playerId);
+      setPlayers(data.players);
+      setTotalRounds(data.totalRounds);
+      setReconnecting(false);
+      setScreen('game');
     };
 
     const onPlayerJoined = (data) => {
@@ -75,7 +107,13 @@ export default function App() {
     const onError = (data) => {
       dlog('error', `server error: ${data.message}`);
       setError(data.message);
-      if (data.message === 'Host disconnected — game ended') {
+      // If a rejoin attempt failed (room gone, game ended), go back to landing.
+      if (reconnectingRef.current) {
+        setReconnecting(false);
+        setScreen('landing');
+        setRoomCode('');
+        setPlayers([]);
+      } else if (data.message === 'Host disconnected — game ended') {
         setScreen('landing');
         setRoomCode('');
         setPlayers([]);
@@ -86,6 +124,7 @@ export default function App() {
     socket.on('disconnect', onDisconnect);
     socket.on('connect_error', onConnectError);
     socket.on('room_joined', onRoomJoined);
+    socket.on('rejoin_game', onRejoinGame);
     socket.on('player_joined', onPlayerJoined);
     socket.on('game_started', onGameStarted);
     socket.on('game_over', onGameOver);
@@ -97,6 +136,7 @@ export default function App() {
       socket.off('disconnect', onDisconnect);
       socket.off('connect_error', onConnectError);
       socket.off('room_joined', onRoomJoined);
+      socket.off('rejoin_game', onRejoinGame);
       socket.off('player_joined', onPlayerJoined);
       socket.off('game_started', onGameStarted);
       socket.off('game_over', onGameOver);
@@ -161,6 +201,7 @@ export default function App() {
     setPlayers([]);
     setScores([]);
     setError('');
+    setReconnecting(false);
   }, []);
 
   const handlePlayAgain = useCallback(() => {
@@ -206,6 +247,15 @@ export default function App() {
           onLeave={handleLeave}
         />
       )}
+
+      {reconnecting && (
+        <div className="fixed inset-0 z-[9998] bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center gap-3">
+          <div className="w-10 h-10 border-2 border-saffron/60 border-t-saffron rounded-full animate-spin" />
+          <p className="text-white font-display text-xl font-bold">Connection lost</p>
+          <p className="text-white/50 font-body text-sm">Rejoining game...</p>
+        </div>
+      )}
+
       <DebugOverlay />
     </div>
   );
