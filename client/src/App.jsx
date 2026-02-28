@@ -68,6 +68,7 @@ export default function App() {
       setIsHost(data.isHost);
       setPlayers(data.players);
       setError('');
+      setReconnecting(false);
       setScreen('lobby');
     };
 
@@ -143,6 +144,16 @@ export default function App() {
       socket.off('back_to_lobby', onBackToLobby);
       socket.off('error', onError);
     };
+  }, []);
+
+  // Re-unlock audio whenever the tab comes back into focus (iOS suspends
+  // the AudioContext when the page is backgrounded or the screen locks).
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') unlockAudio();
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
   }, []);
 
   // Connects if needed, then calls fn() once the socket is open.

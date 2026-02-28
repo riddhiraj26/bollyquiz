@@ -50,6 +50,12 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
       dlog('audio', `ctx.state=${audioCtx.state}`);
       if (audioCtx.state !== 'running') {
         await audioCtx.resume();
+        dlog('audio', `after resume: ctx.state=${audioCtx.state}`);
+        if (audioCtx.state !== 'running') {
+          dlog('audio', 'ctx still suspended — needs tap');
+          setNeedsTap(true);
+          return;
+        }
       }
       const source = audioCtx.createBufferSource();
       source.buffer = buf;

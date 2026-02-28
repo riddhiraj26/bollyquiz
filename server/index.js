@@ -143,23 +143,30 @@ io.on('connection', (socket) => {
           clearTimeout(room.waitingTimer);
           room.waitingTimer = null;
         }
+        const wasHost = room.hostId === disconnectedPlayer.id;
+        if (wasHost) room.hostId = socket.id;
         disconnectedPlayer.id = socket.id;
         disconnectedPlayer.disconnected = false;
         socket.join(code);
         const players = room.players.map(p => ({ id: p.id, name: p.name, score: p.score }));
-        socket.emit('rejoin_game', {
-          roomCode: code,
-          playerId: socket.id,
-          players,
-          totalRounds: room.totalRounds,
-          currentRound: room.currentRound + 1,
-        });
-        socket.to(code).emit('player_rejoined', { playerName: disconnectedPlayer.name, players });
-        console.log(`${playerName} rejoined room ${code}`);
-        if (room.waitingForPlayer) {
-          room.waitingForPlayer = false;
-          setTimeout(() => startRound(room), 1500);
+        if (room.state === 'lobby') {
+          socket.emit('room_joined', { roomCode: code, players, playerId: socket.id, isHost: wasHost });
+          socket.to(code).emit('player_joined', { players });
+        } else {
+          socket.emit('rejoin_game', {
+            roomCode: code,
+            playerId: socket.id,
+            players,
+            totalRounds: room.totalRounds,
+            currentRound: room.currentRound + 1,
+          });
+          socket.to(code).emit('player_rejoined', { playerName: disconnectedPlayer.name, players });
+          if (room.waitingForPlayer) {
+            room.waitingForPlayer = false;
+            setTimeout(() => startRound(room), 1500);
+          }
         }
+        console.log(`${playerName} rejoined room ${code}`);
         return;
       }
 
@@ -267,11 +274,20 @@ io.on('connection', (socket) => {
       if (playerIndex === -1) continue;
 
       if (room.hostId === socket.id) {
-        clearTimeout(room.timer);
-        clearTimeout(room.prepareTimer);
-        clearTimeout(room.waitingTimer);
-        io.to(code).emit('error', { message: 'Host disconnected — game ended' });
-        rooms.delete(code);
+        if (room.state === 'lobby') {
+          // In lobby: give host 30s to come back before closing the room.
+          const player = room.players[playerIndex];
+          player.disconnected = true;
+          player.cleanupTimer = setTimeout(() => {
+            rooms.delete(code);
+          }, 30000);
+        } else {
+          clearTimeout(room.timer);
+          clearTimeout(room.prepareTimer);
+          clearTimeout(room.waitingTimer);
+          io.to(code).emit('error', { message: 'Host disconnected — game ended' });
+          rooms.delete(code);
+        }
       } else if (room.state === 'playing') {
         // Mid-game: keep the player in the room for 30s so they can reconnect.
         const player = room.players[playerIndex];
