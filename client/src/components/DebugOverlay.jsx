@@ -24,7 +24,7 @@ export default function DebugOverlay() {
   }, [entries, open]);
 
   return (
-    <div className="fixed bottom-3 right-3 z-[9999]" style={{ fontFamily: 'monospace', fontSize: 11 }}>
+    <div className="fixed top-3 left-3 z-[9999]" style={{ fontFamily: 'monospace', fontSize: 11 }}>
       <button
         onClick={() => setOpen(o => !o)}
         className="bg-black/80 text-white px-3 py-1.5 rounded-full border border-white/20
