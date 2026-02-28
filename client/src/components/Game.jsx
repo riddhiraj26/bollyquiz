@@ -39,7 +39,7 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
 
   // Plays the decoded buffer through the already-unlocked AudioContext.
   // Because it never touches HTMLAudioElement, iOS autoplay policy doesn't apply.
-  const startPlayback = useCallback(() => {
+  const startPlayback = useCallback(async () => {
     const buf = audioBufferRef.current;
     if (!buf) {
       dlog('error', 'startPlayback: buffer not ready');
@@ -47,7 +47,10 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
     }
     try {
       const audioCtx = getAudioContext();
-      if (audioCtx.state === 'suspended') audioCtx.resume();
+      dlog('audio', `ctx.state=${audioCtx.state}`);
+      if (audioCtx.state !== 'running') {
+        await audioCtx.resume();
+      }
       const source = audioCtx.createBufferSource();
       source.buffer = buf;
       source.connect(audioCtx.destination);
