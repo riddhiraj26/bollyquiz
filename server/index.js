@@ -16,7 +16,7 @@ const io = new Server(server, {
 });
 
 app.use(express.static(path.join(__dirname, '..', 'client', 'dist')));
-app.get('*', (req, res, next) => {
+app.get('*path', (req, res, next) => {
   if (req.url.startsWith('/socket.io')) return next();
   res.sendFile(path.join(__dirname, '..', 'client', 'dist', 'index.html'));
 });
