@@ -56,7 +56,7 @@ function startRound(room) {
     totalRounds: room.totalRounds,
   });
 
-  room.prepareTimer = setTimeout(() => triggerPlay(room), 5000);
+  room.prepareTimer = setTimeout(() => triggerPlay(room), 10000);
 }
 
 function advanceRound(room) {

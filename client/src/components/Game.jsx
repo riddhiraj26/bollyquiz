@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import socket from '../socket';
-import { unlockAudio } from '../audioUnlock';
+import { unlockAudio, getAudioContext } from '../audioUnlock';
 import { dlog } from '../debugLog';
 import Leaderboard from './Leaderboard';
 
@@ -13,23 +13,55 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
   const [timeLeft, setTimeLeft] = useState(30);
   const [needsTap, setNeedsTap] = useState(false);
 
-  const audioRef = useRef(null);
+  const audioBufferRef = useRef(null);  // decoded AudioBuffer ready to play
+  const sourceNodeRef = useRef(null);   // currently playing AudioBufferSourceNode
+  const playPendingRef = useRef(false); // play_now arrived before buffer was decoded
+  const fetchAbortRef = useRef(null);   // AbortController for in-flight fetch
   const inputRef = useRef(null);
   const timerRef = useRef(null);
   const readySentRef = useRef(false);
-  const prepareTimeoutRef = useRef(null);
   const prepareReceivedAtRef = useRef(null);
 
   const cleanupAudio = useCallback(() => {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.src = '';
-      audioRef.current = null;
+    if (fetchAbortRef.current) {
+      fetchAbortRef.current.abort();
+      fetchAbortRef.current = null;
+    }
+    if (sourceNodeRef.current) {
+      try { sourceNodeRef.current.stop(); } catch {}
+      try { sourceNodeRef.current.disconnect(); } catch {}
+      sourceNodeRef.current = null;
+    }
+    audioBufferRef.current = null;
+    playPendingRef.current = false;
+  }, []);
+
+  // Plays the decoded buffer through the already-unlocked AudioContext.
+  // Because it never touches HTMLAudioElement, iOS autoplay policy doesn't apply.
+  const startPlayback = useCallback(() => {
+    const buf = audioBufferRef.current;
+    if (!buf) {
+      dlog('error', 'startPlayback: buffer not ready');
+      return;
+    }
+    try {
+      const audioCtx = getAudioContext();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+      const source = audioCtx.createBufferSource();
+      source.buffer = buf;
+      source.connect(audioCtx.destination);
+      source.start(0);
+      sourceNodeRef.current = source;
+      dlog('audio', 'AudioBufferSource started ✓');
+      setNeedsTap(false);
+    } catch (err) {
+      dlog('error', `AudioBufferSource failed: ${err.message}`);
+      setNeedsTap(true);
     }
   }, []);
 
   useEffect(() => {
-    const handlePrepareRound = ({ roundNumber: rn, previewUrl, totalRounds: tr }) => {
+    const handlePrepareRound = ({ roundNumber: rn, previewUrl }) => {
       const now = Date.now();
       prepareReceivedAtRef.current = now;
       dlog('recv', `prepare_round #${rn} url=...${previewUrl.slice(-12)}`);
@@ -46,12 +78,6 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
       dlog('audio', 'unlockAudio() called');
       unlockAudio();
 
-      const audio = new Audio(previewUrl);
-      audio.preload = 'auto';
-      audioRef.current = audio;
-
-      dlog('audio', 'preloading started...');
-
       const sendReady = () => {
         if (readySentRef.current) return;
         readySentRef.current = true;
@@ -60,22 +86,36 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
         socket.emit('round_ready', { roomCode });
       };
 
-      audio.addEventListener('canplaythrough', () => {
-        const elapsed = Date.now() - prepareReceivedAtRef.current;
-        dlog('audio', `canplaythrough fired (${elapsed}ms)`);
-        sendReady();
-      }, { once: true });
+      // Fetch the audio file and decode it via the Web Audio API.
+      // This bypasses HTMLAudioElement entirely, so iOS autoplay policy never fires.
+      const abortCtrl = new AbortController();
+      fetchAbortRef.current = abortCtrl;
 
-      audio.addEventListener('error', (e) => {
-        dlog('error', `audio load error: ${e.target?.error?.message || 'unknown'}`);
-        sendReady();
-      }, { once: true });
-
-      clearTimeout(prepareTimeoutRef.current);
-      prepareTimeoutRef.current = setTimeout(() => {
-        dlog('audio', 'preload timeout (4.5s), sending ready anyway');
-        sendReady();
-      }, 4500);
+      dlog('audio', 'fetching audio...');
+      fetch(previewUrl, { signal: abortCtrl.signal })
+        .then(res => res.arrayBuffer())
+        .then(arrayBuf => {
+          if (abortCtrl.signal.aborted) return null;
+          return getAudioContext().decodeAudioData(arrayBuf);
+        })
+        .then(audioBuf => {
+          if (!audioBuf || abortCtrl.signal.aborted) return;
+          audioBufferRef.current = audioBuf;
+          const elapsed = Date.now() - prepareReceivedAtRef.current;
+          dlog('audio', `decoded (${elapsed}ms, ${audioBuf.duration.toFixed(1)}s)`);
+          sendReady();
+          // If play_now already arrived while we were still loading, play immediately.
+          if (playPendingRef.current) {
+            playPendingRef.current = false;
+            startPlayback();
+          }
+        })
+        .catch(err => {
+          if (err.name === 'AbortError') return;
+          dlog('error', `audio fetch/decode failed: ${err.message}`);
+          // Signal ready anyway so the game isn't permanently blocked.
+          sendReady();
+        });
     };
 
     const handlePlayNow = () => {
@@ -88,20 +128,12 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
       setTimeLeft(30);
       setNeedsTap(false);
 
-      const audio = audioRef.current;
-      if (audio) {
-        dlog('audio', 'calling audio.play()...');
-        const playPromise = audio.play();
-        if (playPromise && typeof playPromise.then === 'function') {
-          playPromise.then(() => {
-            dlog('audio', 'play() SUCCESS');
-          }).catch((err) => {
-            dlog('error', `play() REJECTED: ${err.message}`);
-            setNeedsTap(true);
-          });
-        }
+      if (audioBufferRef.current) {
+        startPlayback();
       } else {
-        dlog('error', 'play_now but audioRef is null!');
+        // Still fetching/decoding — startPlayback() will fire when ready.
+        dlog('audio', 'buffer not ready yet — will play when decoded');
+        playPendingRef.current = true;
       }
 
       const playStart = Date.now();
@@ -157,20 +189,13 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
       socket.off('round_timeout', handleRoundTimeout);
       cleanupAudio();
       clearInterval(timerRef.current);
-      clearTimeout(prepareTimeoutRef.current);
     };
-  }, [cleanupAudio, roomCode]);
+  }, [cleanupAudio, startPlayback, roomCode]);
 
   const handleTapToPlay = () => {
     dlog('audio', 'user tapped to play');
     unlockAudio();
-    if (audioRef.current) {
-      audioRef.current.play().then(() => {
-        dlog('audio', 'tap play() SUCCESS');
-      }).catch((err) => {
-        dlog('error', `tap play() REJECTED: ${err.message}`);
-      });
-    }
+    startPlayback();
     setNeedsTap(false);
   };
 
