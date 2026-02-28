@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import socket from '../socket';
+import { unlockAudio } from '../audioUnlock';
+import { dlog } from '../debugLog';
 import Leaderboard from './Leaderboard';
 
 export default function Game({ roomCode, playerId, playerName, totalRounds }) {
@@ -8,12 +10,15 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
   const [scores, setScores] = useState([]);
   const [phase, setPhase] = useState('waiting');
   const [roundResult, setRoundResult] = useState(null);
-  const [timerStart, setTimerStart] = useState(null);
   const [timeLeft, setTimeLeft] = useState(30);
+  const [needsTap, setNeedsTap] = useState(false);
 
   const audioRef = useRef(null);
   const inputRef = useRef(null);
   const timerRef = useRef(null);
+  const readySentRef = useRef(false);
+  const prepareTimeoutRef = useRef(null);
+  const prepareReceivedAtRef = useRef(null);
 
   const cleanupAudio = useCallback(() => {
     if (audioRef.current) {
@@ -24,39 +29,95 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
   }, []);
 
   useEffect(() => {
-    const handleRoundStart = ({ roundNumber: rn, previewUrl, startAt, totalRounds: tr }) => {
+    const handlePrepareRound = ({ roundNumber: rn, previewUrl, totalRounds: tr }) => {
+      const now = Date.now();
+      prepareReceivedAtRef.current = now;
+      dlog('recv', `prepare_round #${rn} url=...${previewUrl.slice(-12)}`);
+
       setRoundNumber(rn);
       setAnswer('');
-      setPhase('playing');
+      setPhase('loading');
       setRoundResult(null);
+      setNeedsTap(false);
 
       cleanupAudio();
+      readySentRef.current = false;
+
+      dlog('audio', 'unlockAudio() called');
+      unlockAudio();
+
       const audio = new Audio(previewUrl);
+      audio.preload = 'auto';
       audioRef.current = audio;
 
-      const delay = Math.max(0, startAt - Date.now());
-      const playTimeout = setTimeout(() => {
-        audio.play().catch(() => {});
-      }, delay);
+      dlog('audio', 'preloading started...');
 
-      const roundStartTime = startAt;
-      setTimerStart(roundStartTime);
+      const sendReady = () => {
+        if (readySentRef.current) return;
+        readySentRef.current = true;
+        const elapsed = Date.now() - prepareReceivedAtRef.current;
+        dlog('emit', `round_ready (preload took ${elapsed}ms)`);
+        socket.emit('round_ready', { roomCode });
+      };
+
+      audio.addEventListener('canplaythrough', () => {
+        const elapsed = Date.now() - prepareReceivedAtRef.current;
+        dlog('audio', `canplaythrough fired (${elapsed}ms)`);
+        sendReady();
+      }, { once: true });
+
+      audio.addEventListener('error', (e) => {
+        dlog('error', `audio load error: ${e.target?.error?.message || 'unknown'}`);
+        sendReady();
+      }, { once: true });
+
+      clearTimeout(prepareTimeoutRef.current);
+      prepareTimeoutRef.current = setTimeout(() => {
+        dlog('audio', 'preload timeout (4.5s), sending ready anyway');
+        sendReady();
+      }, 4500);
+    };
+
+    const handlePlayNow = () => {
+      const sincePrepare = prepareReceivedAtRef.current
+        ? Date.now() - prepareReceivedAtRef.current
+        : '?';
+      dlog('recv', `play_now (${sincePrepare}ms since prepare)`);
+
+      setPhase('playing');
       setTimeLeft(30);
+      setNeedsTap(false);
 
+      const audio = audioRef.current;
+      if (audio) {
+        dlog('audio', 'calling audio.play()...');
+        const playPromise = audio.play();
+        if (playPromise && typeof playPromise.then === 'function') {
+          playPromise.then(() => {
+            dlog('audio', 'play() SUCCESS');
+          }).catch((err) => {
+            dlog('error', `play() REJECTED: ${err.message}`);
+            setNeedsTap(true);
+          });
+        }
+      } else {
+        dlog('error', 'play_now but audioRef is null!');
+      }
+
+      const playStart = Date.now();
       clearInterval(timerRef.current);
       timerRef.current = setInterval(() => {
-        const elapsed = (Date.now() - roundStartTime) / 1000;
+        const elapsed = (Date.now() - playStart) / 1000;
         const remaining = Math.max(0, 30 - elapsed);
         setTimeLeft(remaining);
         if (remaining <= 0) clearInterval(timerRef.current);
       }, 100);
 
-      setTimeout(() => inputRef.current?.focus(), delay + 100);
-
-      return () => clearTimeout(playTimeout);
+      setTimeout(() => inputRef.current?.focus(), 100);
     };
 
     const handleRoundWon = (data) => {
+      dlog('recv', `round_won winner=${data.winnerName} answer="${data.correctAnswer}"`);
       setPhase('result');
       setRoundResult({
         type: 'won',
@@ -68,9 +129,11 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
       setScores(data.scores);
       cleanupAudio();
       clearInterval(timerRef.current);
+      setNeedsTap(false);
     };
 
     const handleRoundTimeout = (data) => {
+      dlog('recv', `round_timeout answer="${data.correctAnswer}"`);
       setPhase('result');
       setRoundResult({
         type: 'timeout',
@@ -79,24 +142,42 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
       setScores(data.scores);
       cleanupAudio();
       clearInterval(timerRef.current);
+      setNeedsTap(false);
     };
 
-    socket.on('round_start', handleRoundStart);
+    socket.on('prepare_round', handlePrepareRound);
+    socket.on('play_now', handlePlayNow);
     socket.on('round_won', handleRoundWon);
     socket.on('round_timeout', handleRoundTimeout);
 
     return () => {
-      socket.off('round_start', handleRoundStart);
+      socket.off('prepare_round', handlePrepareRound);
+      socket.off('play_now', handlePlayNow);
       socket.off('round_won', handleRoundWon);
       socket.off('round_timeout', handleRoundTimeout);
       cleanupAudio();
       clearInterval(timerRef.current);
+      clearTimeout(prepareTimeoutRef.current);
     };
-  }, [cleanupAudio]);
+  }, [cleanupAudio, roomCode]);
+
+  const handleTapToPlay = () => {
+    dlog('audio', 'user tapped to play');
+    unlockAudio();
+    if (audioRef.current) {
+      audioRef.current.play().then(() => {
+        dlog('audio', 'tap play() SUCCESS');
+      }).catch((err) => {
+        dlog('error', `tap play() REJECTED: ${err.message}`);
+      });
+    }
+    setNeedsTap(false);
+  };
 
   const handleSubmit = (e) => {
     e.preventDefault();
     if (!answer.trim() || phase !== 'playing') return;
+    dlog('emit', `submit_answer "${answer.trim()}"`);
     socket.emit('submit_answer', {
       roomCode,
       answer: answer.trim(),
@@ -115,14 +196,12 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
     <div className="flex-1 flex flex-col lg:flex-row min-h-screen">
       <div className="flex-1 flex flex-col items-center justify-center px-4 py-6">
         <div className="w-full max-w-lg space-y-6">
-          {/* Round info */}
           <div className="text-center">
             <p className="text-white/40 text-sm font-display">
               Round {roundNumber} of {totalRounds}
             </p>
           </div>
 
-          {/* Timer bar */}
           {phase === 'playing' && (
             <div className="w-full h-2 bg-white/10 rounded-full overflow-hidden">
               <div
@@ -132,13 +211,21 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
             </div>
           )}
 
-          {/* Main content area */}
           {phase === 'waiting' && (
             <div className="text-center py-12">
               <div className="inline-block animate-pulse">
                 <span className="text-4xl">🎵</span>
               </div>
               <p className="text-white/50 mt-4 font-display">Get ready...</p>
+            </div>
+          )}
+
+          {phase === 'loading' && (
+            <div className="text-center py-12">
+              <div className="inline-flex items-center gap-3">
+                <div className="w-5 h-5 border-2 border-saffron/60 border-t-saffron rounded-full animate-spin" />
+                <span className="text-white/50 font-display">Loading song...</span>
+              </div>
             </div>
           )}
 
@@ -151,6 +238,16 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
                   <span className="text-sm text-white/40">{Math.ceil(timeLeft)}s</span>
                 </div>
               </div>
+
+              {needsTap && (
+                <button
+                  onClick={handleTapToPlay}
+                  className="w-full bg-saffron/20 border border-saffron/50 text-saffron font-display
+                             font-bold py-3 rounded-xl hover:bg-saffron/30 transition-colors animate-pulse"
+                >
+                  Tap to hear the song
+                </button>
+              )}
 
               <form onSubmit={handleSubmit} className="space-y-3">
                 <input
@@ -220,7 +317,6 @@ export default function Game({ roomCode, playerId, playerName, totalRounds }) {
         </div>
       </div>
 
-      {/* Leaderboard sidebar */}
       <Leaderboard scores={scores} playerId={playerId} />
     </div>
   );

@@ -10,7 +10,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: process.env.NODE_ENV === 'production' ? undefined : 'http://localhost:5173',
+    origin: process.env.NODE_ENV === 'production' ? undefined : /^http:\/\/localhost:/,
     methods: ['GET', 'POST'],
   },
 });
@@ -21,19 +21,17 @@ app.get('*path', (req, res, next) => {
   res.sendFile(path.join(__dirname, '..', 'client', 'dist', 'index.html'));
 });
 
-function startRound(room) {
-  const song = room.songs[room.currentRound];
-  const startAt = Date.now() + 2000;
-  room.roundAnswered = false;
-  room.roundStartTime = startAt;
+function triggerPlay(room) {
+  clearTimeout(room.prepareTimer);
+  if (room.roundPlaying) return;
+  room.roundPlaying = true;
 
-  io.to(room.code).emit('round_start', {
-    roundNumber: room.currentRound + 1,
-    previewUrl: song.previewUrl,
-    startAt,
-    totalRounds: room.totalRounds,
+  room.roundStartTime = Date.now();
+  io.to(room.code).emit('play_now', {
+    roundStartTime: room.roundStartTime,
   });
 
+  const song = room.songs[room.currentRound];
   room.timer = setTimeout(() => {
     if (!room.roundAnswered) {
       const scores = room.players.map(p => ({ id: p.id, name: p.name, score: p.score }));
@@ -44,6 +42,21 @@ function startRound(room) {
       setTimeout(() => advanceRound(room), 3000);
     }
   }, 32000);
+}
+
+function startRound(room) {
+  const song = room.songs[room.currentRound];
+  room.roundAnswered = false;
+  room.roundPlaying = false;
+  room.readyPlayers = new Set();
+
+  io.to(room.code).emit('prepare_round', {
+    roundNumber: room.currentRound + 1,
+    previewUrl: song.previewUrl,
+    totalRounds: room.totalRounds,
+  });
+
+  room.prepareTimer = setTimeout(() => triggerPlay(room), 5000);
 }
 
 function advanceRound(room) {
@@ -144,6 +157,15 @@ io.on('connection', (socket) => {
     setTimeout(() => startRound(room), 1000);
   });
 
+  socket.on('round_ready', ({ roomCode }) => {
+    const room = getRoom(roomCode);
+    if (!room || room.state !== 'playing' || !room.readyPlayers) return;
+    room.readyPlayers.add(socket.id);
+    if (room.readyPlayers.size >= room.players.length) {
+      triggerPlay(room);
+    }
+  });
+
   socket.on('submit_answer', ({ roomCode, answer, timestamp }) => {
     const room = getRoom(roomCode);
     if (!room || room.state !== 'playing' || room.roundAnswered) return;
@@ -192,6 +214,7 @@ io.on('connection', (socket) => {
 
       if (room.hostId === socket.id) {
         clearTimeout(room.timer);
+        clearTimeout(room.prepareTimer);
         io.to(code).emit('error', { message: 'Host disconnected — game ended' });
         rooms.delete(code);
       } else {
