@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import socket from './socket';
+import { unlockAudio } from './audioUnlock';
 import Landing from './components/Landing';
 import Lobby from './components/Lobby';
 import Game from './components/Game';
@@ -69,16 +70,19 @@ export default function App() {
   }, []);
 
   const handleCreateRoom = useCallback((name) => {
+    unlockAudio();
     setPlayerName(name);
     socket.emit('join_room', { playerName: name });
   }, []);
 
   const handleJoinRoom = useCallback((name, code) => {
+    unlockAudio();
     setPlayerName(name);
     socket.emit('join_room', { roomCode: code, playerName: name });
   }, []);
 
   const handleStartGame = useCallback(() => {
+    unlockAudio();
     socket.emit('start_game', { roomCode });
   }, [roomCode]);
 
